@@ -1,0 +1,17 @@
+{
+  "Records": [
+    {
+      "messageId": "11111111-1111-1111-1111-111111111111",
+      "body": "{\"Records\":[{\"eventVersion\":\"2.1\",\"eventSource\":\"aws:s3\",\"awsRegion\":\"us-east-1\",\"eventTime\":\"2026-07-15T12:00:00.000Z\",\"eventName\":\"ObjectCreated:Put\",\"s3\":{\"bucket\":{\"name\":\"pipeline-prototype-dev-incoming-123456789012\"},\"object\":{\"key\":\"incoming/students/students_dump_20260715.csv\"}}}]}",
+      "attributes": {
+        "MessageGroupId": "students",
+        "SequenceNumber": "1"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "placeholder",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:pipeline-prototype-dev-ingest.fifo",
+      "awsRegion": "us-east-1"
+    }
+  ]
+}
