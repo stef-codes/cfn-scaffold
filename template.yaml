@@ -1,9 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Prototype pipeline: S3 -> SQS (FIFO) -> Lambda -> Step Functions.
-  Pure CloudFormation, no SAM transform -- mirrors the resource style
-  used for the government project. Personal-account prototype only,
-  no real/CUI data.
+  Synthetic LMS delivery prototype: S3 -> SQS -> Lambda -> mock HTTP API.
+  The Lambda reads a CSV from S3 and writes an S3 checkpoint only after
+  every row is accepted by the API. Pure CloudFormation; no SAM transform.
 
 Parameters:
   Environment:
@@ -15,17 +14,12 @@ Parameters:
     Default: pipeline-prototype
   LambdaCodeS3Bucket:
     Type: String
-    Description: >
-      S3 bucket holding the zipped Lambda deployment package.
-      Populated by `aws cloudformation package` (see README) --
-      you do not fill this in by hand.
+    Description: S3 bucket containing the Lambda deployment ZIP.
   LambdaCodeS3Key:
     Type: String
-    Description: S3 key for the zipped Lambda deployment package.
+    Description: S3 key for the Lambda deployment ZIP.
 
 Resources:
-
-  # ---------- KMS key for SSE and future Secrets Manager use ----------
   PipelineKmsKey:
     Type: AWS::KMS::Key
     Properties:
@@ -40,72 +34,38 @@ Resources:
               AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
-          - Sid: AllowS3Service
+          - Sid: AllowAwsServices
             Effect: Allow
             Principal:
-              Service: s3.amazonaws.com
-            Action:
-              - kms:Decrypt
-              - kms:GenerateDataKey
-            Resource: '*'
-          - Sid: AllowLambdaRoleUse
-            Effect: Allow
-            Principal:
-              AWS: !GetAtt IntakeFunctionRole.Arn
+              Service:
+                - s3.amazonaws.com
+                - sqs.amazonaws.com
             Action:
               - kms:Decrypt
               - kms:GenerateDataKey
             Resource: '*'
 
-  # ---------- S3: landing bucket for incoming dumps ----------
-  IncomingBucket:
-    Type: AWS::S3::Bucket
-    DependsOn: IngestQueuePolicy
+  IngestDLQ:
+    Type: AWS::SQS::Queue
     Properties:
-      BucketName: !Sub '${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref PipelineKmsKey
-      VersioningConfiguration:
-        Status: Enabled
-      NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:*
-            Queue: !GetAtt IngestQueue.Arn
+      QueueName: !Sub '${ProjectName}-${Environment}-ingest-dlq'
+      KmsMasterKeyId: !Ref PipelineKmsKey
+      MessageRetentionPeriod: 1209600
 
-  # ---------- SQS: FIFO ingest queue, grouped per-table ----------
   IngestQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub '${ProjectName}-${Environment}-ingest.fifo'
-      FifoQueue: true
-      ContentBasedDeduplication: true
+      QueueName: !Sub '${ProjectName}-${Environment}-ingest'
       VisibilityTimeout: 180
       KmsMasterKeyId: !Ref PipelineKmsKey
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt IngestDLQ.Arn
         maxReceiveCount: 5
 
-  # DLQ catches SQS-message-level failures only (Lambda repeatedly
-  # failing to process a message). Step Functions execution failures
-  # and any future DataSync task failures need their own separate
-  # alarms -- see StateMachineFailureAlarm below and do not assume
-  # this DLQ covers those paths.
-  IngestDLQ:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub '${ProjectName}-${Environment}-ingest-dlq.fifo'
-      FifoQueue: true
-      KmsMasterKeyId: !Ref PipelineKmsKey
-      MessageRetentionPeriod: 1209600 # 14 days
-
   IngestQueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
-      Queues:
-        - !Ref IngestQueue
+      Queues: [!Ref IngestQueue]
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -118,27 +78,42 @@ Resources:
             Condition:
               ArnEquals:
                 aws:SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
 
-  # ---------- DynamoDB: tracks latest_successful_snapshot per table ----------
-  SnapshotTable:
-    Type: AWS::DynamoDB::Table
+  IncomingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IngestQueuePolicy
     Properties:
-      TableName: !Sub '${ProjectName}-${Environment}-snapshots'
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: table_name
-          AttributeType: S
-      KeySchema:
-        - AttributeName: table_name
-          KeyType: HASH
-      SSESpecification:
-        SSEEnabled: true
+      BucketName: !Sub '${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref PipelineKmsKey
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt IngestQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .csv
 
-  # ---------- IAM: execution role for the intake Lambda ----------
-  IntakeFunctionRole:
+  ProcessFunctionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${ProjectName}-${Environment}-intake-role'
+      RoleName: !Sub '${ProjectName}-${Environment}-process-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -149,164 +124,128 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: intake-permissions
+        - PolicyName: process-permissions
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: ReadSqs
+              - Sid: ConsumeQueue
                 Effect: Allow
                 Action:
                   - sqs:ReceiveMessage
                   - sqs:DeleteMessage
                   - sqs:GetQueueAttributes
                 Resource: !GetAtt IngestQueue.Arn
-              - Sid: ReadDynamoSnapshot
+              - Sid: ReadIncomingAndManageCheckpoints
                 Effect: Allow
                 Action:
-                  - dynamodb:GetItem
-                Resource: !GetAtt SnapshotTable.Arn
-              - Sid: StartStateMachine
-                Effect: Allow
-                Action:
-                  - states:StartExecution
-                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-pipeline'
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${IncomingBucket.Arn}/incoming/*'
+                  - !Sub '${IncomingBucket.Arn}/checkpoints/*'
               - Sid: UseKmsKey
                 Effect: Allow
                 Action:
                   - kms:Decrypt
                   - kms:GenerateDataKey
                 Resource: !GetAtt PipelineKmsKey.Arn
+              - Sid: WriteXrayTrace
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
 
-  # ---------- Lambda: intake function ----------
-  IntakeFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-${Environment}-intake'
-      Runtime: python3.12
-      Handler: process_dump.handler
-      Role: !GetAtt IntakeFunctionRole.Arn
-      Timeout: 30
-      MemorySize: 256
-      TracingConfig:
-        Mode: Active
-      Environment:
-        Variables:
-          ENVIRONMENT: !Ref Environment
-          SNAPSHOT_TABLE: !Ref SnapshotTable
-          STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-pipeline'
-      Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
-
-  IntakeFunctionEventSourceMapping:
-    Type: AWS::Lambda::EventSourceMapping
-    Properties:
-      EventSourceArn: !GetAtt IngestQueue.Arn
-      FunctionName: !GetAtt IntakeFunction.Arn
-      BatchSize: 1
-
-  # ---------- IAM: execution role for the state machine ----------
-  StateMachineRole:
+  MockReceiverRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${ProjectName}-${Environment}-sfn-role'
+      RoleName: !Sub '${ProjectName}-${Environment}-mock-receiver-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: states.amazonaws.com
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: state-machine-permissions
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: WriteSnapshot
-                Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                Resource: !GetAtt SnapshotTable.Arn
-              - Sid: PutMetrics
-                Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-  # ---------- Step Functions: orchestrates validation -> delta/full -> snapshot update ----------
-  PipelineStateMachine:
-    Type: AWS::StepFunctions::StateMachine
+  MockReceiverFunction:
+    Type: AWS::Lambda::Function
     Properties:
-      StateMachineName: !Sub '${ProjectName}-${Environment}-pipeline'
-      RoleArn: !GetAtt StateMachineRole.Arn
-      DefinitionString: !Sub |
-        {
-          "Comment": "Prototype pipeline: validate -> decide delta/full -> process -> update snapshot",
-          "StartAt": "ValidateInput",
-          "States": {
-            "ValidateInput": {
-              "Type": "Pass",
-              "Comment": "Placeholder for schema/structure validation of the incoming dump.",
-              "Next": "HasPriorSnapshot"
-            },
-            "HasPriorSnapshot": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.last_successful_snapshot_key",
-                  "IsNull": true,
-                  "Next": "FullLoad"
-                }
-              ],
-              "Default": "DeltaLoad"
-            },
-            "FullLoad": {
-              "Type": "Pass",
-              "Comment": "No prior snapshot for this table -- placeholder for full-load processing task.",
-              "ResultPath": "$.processing_result",
-              "Next": "UpdateSnapshot"
-            },
-            "DeltaLoad": {
-              "Type": "Pass",
-              "Comment": "Prior snapshot exists -- placeholder for delta/catch-up processing task, diffed against last_successful_snapshot_key (not a calendar date).",
-              "ResultPath": "$.processing_result",
-              "Next": "UpdateSnapshot"
-            },
-            "UpdateSnapshot": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::dynamodb:putItem",
-              "Parameters": {
-                "TableName": "${SnapshotTable}",
-                "Item": {
-                  "table_name": {"S.$": "$.table_name"},
-                  "s3_key": {"S.$": "$.key"},
-                  "processed_at": {"S.$": "$$.State.EnteredTime"}
-                }
-              },
-              "Comment": "Only reached on successful processing -- this is what makes it latest_successful_snapshot rather than latest_attempted.",
-              "End": true
-            }
-          }
-        }
+      FunctionName: !Sub '${ProjectName}-${Environment}-mock-receiver'
+      Runtime: python3.12
+      Handler: mock_receiver.handler
+      Role: !GetAtt MockReceiverRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
 
-  # ---------- CloudWatch: Step Functions execution failures ----------
-  StateMachineFailureAlarm:
-    Type: AWS::CloudWatch::Alarm
+  MockApi:
+    Type: AWS::ApiGatewayV2::Api
     Properties:
-      AlarmName: !Sub '${ProjectName}-${Environment}-sfn-execution-failed'
-      Namespace: AWS/States
-      MetricName: ExecutionsFailed
-      Dimensions:
-        - Name: StateMachineArn
-          Value: !Ref PipelineStateMachine
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
+      Name: !Sub '${ProjectName}-${Environment}-mock-api'
+      ProtocolType: HTTP
 
-  # ---------- CloudWatch: SQS DLQ depth (queue-message failures only) ----------
+  MockApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MockApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt MockReceiverFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  MockApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MockApi
+      RouteKey: 'POST /learning-objects'
+      Target: !Sub 'integrations/${MockApiIntegration}'
+
+  MockApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref MockApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  MockApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MockReceiverFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MockApi}/*/POST/learning-objects'
+
+  ProcessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-process-dump'
+      Runtime: python3.12
+      Handler: process_dump.handler
+      Role: !GetAtt ProcessFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          API_URL: !Sub '${MockApi.ApiEndpoint}/learning-objects'
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+
+  ProcessFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IngestQueue.Arn
+      FunctionName: !GetAtt ProcessFunction.Arn
+      BatchSize: 1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
   DlqDepthAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -323,18 +262,12 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
-  # NOTE: If/when DataSync is added for on-prem -> S3 transfer, it needs
-  # its own separate alarm on TaskExecutionResult/Status -- do not rely
-  # on the alarms above to catch DataSync task failures.
-
 Outputs:
   IncomingBucketName:
     Value: !Ref IncomingBucket
   IngestQueueUrl:
     Value: !Ref IngestQueue
-  StateMachineArn:
-    Value: !Ref PipelineStateMachine
-  SnapshotTableName:
-    Value: !Ref SnapshotTable
-  IntakeFunctionName:
-    Value: !Ref IntakeFunction
+  ProcessFunctionName:
+    Value: !Ref ProcessFunction
+  MockApiUrl:
+    Value: !Sub '${MockApi.ApiEndpoint}/learning-objects'
