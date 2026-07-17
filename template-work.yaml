@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Work MVP of the delivery prototype: S3 -> Lambda -> logging -> S3
+  checkpoint. Creates no IAM resources - the Lambda execution role is
+  provided by the cloud team as a parameter, so the deploy needs no
+  CAPABILITY_NAMED_IAM. No SQS, KMS, Secrets Manager, or VPC; add those
+  only when actual requirements call for them. Region-agnostic.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test]
+  ProjectName:
+    Type: String
+    Default: cornerstone-pipeline
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: Approved artifacts bucket containing the Lambda deployment ZIP.
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key for the Lambda deployment ZIP.
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: >
+      ARN of the pre-approved Lambda execution role created by the cloud
+      team. See RUNBOOK-work.md for the permissions it must include.
+    AllowedPattern: 'arn:[a-z-]+:iam::\d{12}:role/.+'
+  TechnicalOwner:
+    Type: String
+    Description: >
+      Required technical-owner tag value; ask for the exact approved
+      value. If the organization's tag KEY differs from "TechnicalOwner"
+      (e.g. technical-owner, Technical-Owner), edit the Key literals in
+      this template to match their spelling exactly.
+
+Resources:
+  IncomingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokePermission
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
+
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+      SourceAccount: !Ref AWS::AccountId
+
+  ProcessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-process-dump'
+      Runtime: python3.12
+      Handler: process_dump_mvp.handler
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
+
+Outputs:
+  IncomingBucketName:
+    Value: !Ref IncomingBucket
+  ProcessFunctionName:
+    Value: !Ref ProcessFunction

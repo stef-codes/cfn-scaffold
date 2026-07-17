@@ -69,6 +69,19 @@ IAM, encryption, and Secrets Manager instead:
   `ListBucket` on the checkpoints prefix, `Decrypt`/`GenerateDataKey`
   on the key, and `GetSecretValue` on that one secret.
 
+### Work variant — [template-work.yaml](template-work.yaml)
+
+Stack `cornerstone-pipeline-dev`. The shape to mimic at work: S3 →
+Lambda → logging → checkpoint, using infrastructure the cloud team
+already controls. It creates **no IAM resources** — the Lambda
+execution role is passed in as a parameter, so deploying needs no
+`CAPABILITY_NAMED_IAM` — and leaves out SQS, KMS, Secrets Manager, and
+VPC until requirements call for them. It reuses the MVP handler
+unchanged. Follow [RUNBOOK-work.md](RUNBOOK-work.md), which covers the
+work-specific flow: what to ask the architect for, the execution-role
+policy to request, change-set preview before deploy, and when to add
+each omitted component back.
+
 ## Tagging
 
 Every taggable resource carries a `TechnicalOwner` tag, set from the
@@ -110,4 +123,5 @@ posting them).
   `process_dump_secure.py` for the secrets variant)
 - `tests/` — handler unit tests (`python3 -m unittest discover -s tests`)
 - `events/` — sample CSV and event payloads
-- [RUNBOOK.md](RUNBOOK.md) — deploy, verify, troubleshoot, clean up
+- [RUNBOOK.md](RUNBOOK.md) — deploy, verify, troubleshoot, clean up (personal AWS)
+- [RUNBOOK-work.md](RUNBOOK-work.md) — the work-environment version of the same
