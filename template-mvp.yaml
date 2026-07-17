@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MVP variant of the synthetic LMS delivery prototype: S3 -> Lambda only.
+  S3 invokes the Lambda directly; the Lambda validates and maps each CSV
+  row, logs the mapped payloads, and writes an S3 checkpoint only after
+  every row is valid. No SQS, API Gateway, or KMS resources.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test]
+  ProjectName:
+    Type: String
+    Default: pipeline-mvp
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment ZIP.
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key for the Lambda deployment ZIP.
+  LambdaSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets used by the Lambda function.
+  LambdaSecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security groups attached to the Lambda function.
+  TechnicalOwner:
+    Type: String
+    Default: stefcodes@gmail.com
+    Description: Contact applied as the TechnicalOwner tag on all taggable resources.
+
+Resources:
+  IncomingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokePermission
+    Properties:
+      BucketName:
+        Fn::Sub: '${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function:
+              Fn::GetAtt: [ProcessFunction, Arn]
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: TechnicalOwner
+          Value:
+            Ref: TechnicalOwner
+
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: ProcessFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::Sub: 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+      SourceAccount:
+        Ref: AWS::AccountId
+
+  ProcessFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: '${ProjectName}-${Environment}-process-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Tags:
+        - Key: TechnicalOwner
+          Value:
+            Ref: TechnicalOwner
+
+  ProcessFunctionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows the process function to read inputs and write checkpoints.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadIncomingAndManageCheckpoints
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - Fn::Sub: 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}/incoming/*'
+              - Fn::Sub: 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}/checkpoints/*'
+          # Without ListBucket, GetObject on a missing checkpoint returns 403,
+          # not 404, and the first-run detection in get_checkpoint breaks.
+          - Sid: DetectMissingCheckpoints
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource:
+              - Fn::Sub: 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+            Condition:
+              StringLike:
+                s3:prefix: 'checkpoints/*'
+      Roles:
+        - Ref: ProcessFunctionRole
+
+  ProcessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: '${ProjectName}-${Environment}-process-dump'
+      Runtime: python3.12
+      Handler: process_dump_mvp.handler
+      Role:
+        Fn::GetAtt: [ProcessFunctionRole, Arn]
+      Timeout: 120
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          Ref: LambdaSecurityGroupIds
+        SubnetIds:
+          Ref: LambdaSubnetIds
+      Code:
+        S3Bucket:
+          Ref: LambdaCodeS3Bucket
+        S3Key:
+          Ref: LambdaCodeS3Key
+      Tags:
+        - Key: TechnicalOwner
+          Value:
+            Ref: TechnicalOwner
+
+Outputs:
+  IncomingBucketName:
+    Value:
+      Ref: IncomingBucket
+  ProcessFunctionName:
+    Value:
+      Ref: ProcessFunction

@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MVP variant without VPC networking: S3 -> Lambda, with a customer-managed
+  KMS key encrypting the bucket and secret, and a Secrets Manager secret
+  holding a synthetic API key the Lambda loads at runtime. No SQS, API
+  Gateway, or VPC resources.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test]
+  ProjectName:
+    Type: String
+    Default: pipeline-secure
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment ZIP.
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key for the Lambda deployment ZIP.
+  TechnicalOwner:
+    Type: String
+    Default: stefcodes@gmail.com
+    Description: Contact applied as the TechnicalOwner tag on all taggable resources.
+
+Resources:
+  PipelineKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} ${Environment}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
+
+  PipelineKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}'
+      TargetKeyId: !Ref PipelineKmsKey
+
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api-key'
+      Description: Synthetic API key for the delivery prototype. Not a real credential.
+      KmsKeyId: !Ref PipelineKmsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: api_key
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
+
+  IncomingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokePermission
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref PipelineKmsKey
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
+
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+      SourceAccount: !Ref AWS::AccountId
+
+  ProcessFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-process-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: process-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadIncomingAndManageCheckpoints
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}/incoming/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}/checkpoints/*'
+              # Without ListBucket, GetObject on a missing checkpoint returns
+              # 403, not 404, and the first-run detection in get_checkpoint
+              # breaks.
+              - Sid: DetectMissingCheckpoints
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-incoming-${AWS::AccountId}'
+                Condition:
+                  StringLike:
+                    s3:prefix: 'checkpoints/*'
+              - Sid: UseKmsKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt PipelineKmsKey.Arn
+              - Sid: ReadApiKeySecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecret
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
+
+  ProcessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-process-dump'
+      Runtime: python3.12
+      Handler: process_dump_secure.handler
+      Role: !GetAtt ProcessFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref ApiKeySecret
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
+
+Outputs:
+  IncomingBucketName:
+    Value: !Ref IncomingBucket
+  ProcessFunctionName:
+    Value: !Ref ProcessFunction
+  ApiKeySecretArn:
+    Value: !Ref ApiKeySecret

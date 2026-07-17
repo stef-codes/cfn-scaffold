@@ -18,6 +18,10 @@ Parameters:
   LambdaCodeS3Key:
     Type: String
     Description: S3 key for the Lambda deployment ZIP.
+  TechnicalOwner:
+    Type: String
+    Default: stefcodes@gmail.com
+    Description: Contact applied as the TechnicalOwner tag on all taggable resources.
 
 Resources:
   PipelineKmsKey:
@@ -44,6 +48,9 @@ Resources:
               - kms:Decrypt
               - kms:GenerateDataKey
             Resource: '*'
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   IngestDLQ:
     Type: AWS::SQS::Queue
@@ -51,6 +58,9 @@ Resources:
       QueueName: !Sub '${ProjectName}-${Environment}-ingest-dlq'
       KmsMasterKeyId: !Ref PipelineKmsKey
       MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   IngestQueue:
     Type: AWS::SQS::Queue
@@ -61,6 +71,9 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt IngestDLQ.Arn
         maxReceiveCount: 5
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   IngestQueuePolicy:
     Type: AWS::SQS::QueuePolicy
@@ -109,6 +122,9 @@ Resources:
                     Value: incoming/
                   - Name: suffix
                     Value: .csv
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   ProcessFunctionRole:
     Type: AWS::IAM::Role
@@ -155,6 +171,9 @@ Resources:
                   - xray:PutTraceSegments
                   - xray:PutTelemetryRecords
                 Resource: '*'
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   MockReceiverRole:
     Type: AWS::IAM::Role
@@ -169,6 +188,9 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   MockReceiverFunction:
     Type: AWS::Lambda::Function
@@ -182,12 +204,17 @@ Resources:
       Code:
         S3Bucket: !Ref LambdaCodeS3Bucket
         S3Key: !Ref LambdaCodeS3Key
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   MockApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:
       Name: !Sub '${ProjectName}-${Environment}-mock-api'
       ProtocolType: HTTP
+      Tags:
+        TechnicalOwner: !Ref TechnicalOwner
 
   MockApiIntegration:
     Type: AWS::ApiGatewayV2::Integration
@@ -210,6 +237,8 @@ Resources:
       ApiId: !Ref MockApi
       StageName: '$default'
       AutoDeploy: true
+      Tags:
+        TechnicalOwner: !Ref TechnicalOwner
 
   MockApiInvokePermission:
     Type: AWS::Lambda::Permission
@@ -236,6 +265,9 @@ Resources:
       Code:
         S3Bucket: !Ref LambdaCodeS3Bucket
         S3Key: !Ref LambdaCodeS3Key
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   ProcessFunctionEventSourceMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -245,6 +277,9 @@ Resources:
       BatchSize: 1
       FunctionResponseTypes:
         - ReportBatchItemFailures
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
   DlqDepthAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -261,6 +296,9 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      Tags:
+        - Key: TechnicalOwner
+          Value: !Ref TechnicalOwner
 
 Outputs:
   IncomingBucketName:
